@@ -1334,6 +1334,7 @@ version = "0.20.1"
 dependencies = [
  "bitflags",
  "indexmap",
+ "rayon",
  "rustc-hash",
  "tsrs_ast",
  "tsrs_astnav",
