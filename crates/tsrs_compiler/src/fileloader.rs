@@ -1129,6 +1129,8 @@ pub(crate) struct PrefetchedResolutions {
     // The file's resolutions keyed by module name and mode, inserted in import order: what the sequential load builds
     // for a file without synthetic imports, so it takes this one instead (the same hashing and insertion sequence).
     resolutions_in_file: ModeAwareCache<P<ResolvedModule>>,
+    // The file's synthetic imports by module name, which the sequential load takes for the mode of its own node.
+    synthetic_imports: Vec<(String, PrefetchedImport)>,
 }
 
 impl PrefetchedResolutions {
@@ -1349,12 +1351,72 @@ pub(crate) fn prefetch_resolutions(
             imports.push(Some(PrefetchedImport { resolution, mode, prepared }));
         }
     }
+    let mut synthetic_imports = Vec::new();
+    if !opts.skip_module_resolution {
+        let (helpers, jsx_import) = synthetic_import_modules(file, &options_for_file);
+        let mode = mode_for_synthetic_import(file.file_name(), meta, &options_for_file);
+        let helpers = helpers.then_some(EXTERNAL_HELPERS_MODULE_NAME_TEXT);
+        let jsx_import = (!jsx_import.is_empty()).then_some(jsx_import.as_str());
+        for module_name in helpers.into_iter().chain(jsx_import) {
+            // As in resolve_imports_and_module_augmentations: a module declared in the file is not resolved.
+            if !file.ambient_module_names().contains(&module_name) {
+                let resolution =
+                    resolver.resolve_module_name(module_name, &file_name, mode, redirect);
+                let import = PrefetchedImport { resolution, mode, prepared: None };
+                synthetic_imports.push((module_name.to_string(), import));
+            }
+        }
+    }
     PrefetchedResolutions {
         referenced_files,
         imports,
         type_references,
         reason_path,
         resolutions_in_file,
+        synthetic_imports,
+    }
+}
+
+// Whether the file loader gives `file` an import of the helpers module, and the JSX runtime module it gives it an
+// import of ("" for none): fileloader.go:598 and :607.
+fn synthetic_import_modules(
+    file: P<SourceFile>,
+    options_for_file: &CompilerOptions,
+) -> (bool, String) {
+    let is_java_script_file = ast::is_source_file_js(file);
+    let is_external_module_file = ast::is_external_module(file);
+    let helpers = (is_java_script_file
+        || (!file.is_declaration_file.get()
+            && (options_for_file.get_isolated_modules() || is_external_module_file)))
+        && options_for_file.import_helpers.is_true();
+    let jsx_import = if is_java_script_file || file.script_kind.get() == tsrs_core::ScriptKind::TSX
+    {
+        ast::get_jsx_runtime_import(
+            &ast::get_jsx_implicit_import_base(options_for_file, Some(file)),
+            options_for_file,
+        )
+    } else {
+        String::new()
+    };
+    (helpers, jsx_import)
+}
+
+// What `get_mode_for_usage_location` answers for the specifier of a plain import declaration (a synthetic import).
+fn mode_for_synthetic_import(
+    file_name: &str,
+    meta: &SourceFileMetaData,
+    options: &CompilerOptions,
+) -> ResolutionMode {
+    if !import_syntax_affects_module_resolution(options) {
+        return ModuleKind::NONE;
+    }
+    let file_emit_mode = ast::get_emit_module_format_of_file_worker(file_name, options, meta);
+    if file_emit_mode == ModuleKind::COMMON_JS {
+        ModuleKind::COMMON_JS
+    } else if file_emit_mode.is_non_node_esm() || file_emit_mode == ModuleKind::PRESERVE {
+        ModuleKind::ES_NEXT
+    } else {
+        ModuleKind::NONE
     }
 }
 
@@ -1527,9 +1589,6 @@ impl FileLoader {
         let mut module_names: Vec<P<Node>> =
             Vec::with_capacity(imports.len() + file.module_augmentations.get().len() + 2);
 
-        let is_java_script_file = ast::is_source_file_js(file);
-        let is_external_module_file = ast::is_external_module(file);
-
         let (redirect, file_name) =
             self.project_references.get_redirect_for_resolution(file.file_name(), file.path());
         let redirect =
@@ -1538,30 +1597,18 @@ impl FileLoader {
             self.opts.config.compiler_options().unwrap(),
             redirect,
         );
-        if (is_java_script_file
-            || (!file.is_declaration_file.get()
-                && (options_for_file.get_isolated_modules() || is_external_module_file)))
-            && options_for_file.import_helpers.is_true()
-        {
+        let (helpers, jsx_import) = synthetic_import_modules(file, &options_for_file);
+        if helpers {
             let specifier = self.create_synthetic_import(EXTERNAL_HELPERS_MODULE_NAME_TEXT, file);
             module_names.push(specifier);
             self.tasks[t].data().import_helpers_import_specifier = Some(specifier);
         }
 
-        if is_java_script_file || file.script_kind.get() == tsrs_core::ScriptKind::TSX {
-            let jsx_import = ast::get_jsx_runtime_import(
-                &ast::get_jsx_implicit_import_base(&options_for_file, Some(file)),
-                &options_for_file,
-            );
-            if !jsx_import.is_empty() {
-                let specifier = self.create_synthetic_import(&jsx_import, file);
-                module_names.push(specifier);
-                self.tasks[t].data().jsx_runtime_import_specifier =
-                    Some(P::new(JsxRuntimeImportSpecifier {
-                        module_reference: jsx_import,
-                        specifier,
-                    }));
-            }
+        if !jsx_import.is_empty() {
+            let specifier = self.create_synthetic_import(&jsx_import, file);
+            module_names.push(specifier);
+            self.tasks[t].data().jsx_runtime_import_specifier =
+                Some(P::new(JsxRuntimeImportSpecifier { module_reference: jsx_import, specifier }));
         }
 
         let imports_start = module_names.len();
@@ -1606,7 +1653,10 @@ impl FileLoader {
                 data.resolutions_trace = resolutions_trace;
                 return;
             }
-            let mut prefetched = prefetched.map(|p| p.imports);
+            let (mut prefetched, mut synthetic_imports) = match prefetched {
+                Some(prefetched) => (Some(prefetched.imports), prefetched.synthetic_imports),
+                None => (None, Vec::new()),
+            };
             // The metadata (two strings, cloned) only serves resolution modes the prefetch did not compute.
             let meta = if prefetched.is_none() || imports_start > 0 {
                 Some(self.tasks[t].metadata())
@@ -1654,11 +1704,21 @@ impl FileLoader {
                         resolutions_trace.extend(trace);
                         continue;
                     }
-                    (
-                        self.resolver.resolve_module_name(module_name, &file_name, mode, redirect),
-                        mode,
-                        None,
-                    )
+                    let resolution = synthetic_imports
+                        .iter()
+                        .position(|(name, p)| name == module_name && p.mode == mode)
+                        .map_or_else(
+                            || {
+                                self.resolver.resolve_module_name(
+                                    module_name,
+                                    &file_name,
+                                    mode,
+                                    redirect,
+                                )
+                            },
+                            |found| synthetic_imports.swap_remove(found).1.resolution,
+                        );
+                    (resolution, mode, None)
                 };
                 let (resolved_module, trace) = match resolution {
                     Ok((resolved_module, trace)) => (resolved_module, trace),
