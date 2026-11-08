@@ -105,3 +105,50 @@ fn repeated_library_calls_observe_changed_project_configuration() {
         .join()
         .unwrap();
 }
+
+#[test]
+fn a_request_frees_each_program_before_the_next() {
+    // The measure is how far chunks were ever carved into the arenas' address range, which plain pointers do not have.
+    // Poisoning never uses freed memory again.
+    if !tsrs_core::COMPRESSED_PTRS
+        || std::env::var_os("TSRS_ARENA_POISON").is_some_and(|v| v == "1")
+        || !crate::isolated::in_child("lifecycle::a_request_frees_each_program_before_the_next")
+    {
+        return;
+    }
+    std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(|| {
+            let cwd = std::env::current_dir().unwrap().to_string_lossy().into_owned();
+            // Programs with nothing in common, each one large file: a request that keeps its programs carves it again.
+            let source = format!("declare const n: number; n as number;{}", " n;".repeat(100_000));
+            let config = r#"{"compilerOptions":{"noLib":true,"types":[]},"files":["index.ts"]}"#;
+            let rule = "no-unnecessary-type-assertion";
+            let lint = |projects| {
+                let before = tsrs_core::ptr::reserve_stats().unwrap().1;
+                let rules = vec![ConfiguredRule { name: rule.into(), ..Default::default() }];
+                let mut payload = Payload::default();
+                payload.configs.push(Config { rules, ..Default::default() });
+                for project in 0..projects {
+                    let base = format!("{cwd}/target/lint-program-memory-lifecycle/{project}");
+                    payload.source_overrides.insert(format!("{base}/tsconfig.json"), config.into());
+                    payload.source_overrides.insert(format!("{base}/index.ts"), source.clone());
+                    payload.configs[0].file_paths.push(format!("{base}/index.ts"));
+                }
+                let mut output = Vec::new();
+                engine::run(&payload, Options::default(), &cwd, &mut output).unwrap();
+                let findings = String::from_utf8_lossy(&output).matches(rule).count();
+                assert_eq!(findings, projects, "one finding per program");
+                tsrs_core::ptr::reserve_stats().unwrap().1 - before
+            };
+            let two = lint(2);
+            let twelve_more = lint(14);
+            assert!(
+                twelve_more < two,
+                "14 programs carved {twelve_more} bytes more than 2 programs, which carved {two}"
+            );
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
